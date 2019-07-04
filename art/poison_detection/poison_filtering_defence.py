@@ -33,23 +33,20 @@ class PoisonFilteringDefence(ABC):
     """
     defence_params = ['classifier']
 
-    def __init__(self, classifier, x_train, y_train, verbose=True):
+    def __init__(self, classifier, x_train, y_train):
         """
-        Create an :class:`ActivationDefence` object with the provided classifier.
+        Create an :class:`.ActivationDefence` object with the provided classifier.
 
         :param classifier: model evaluated for poison
-        :type classifier: :class:`Classifier`
-        :param x_train: dataset used to train `classifier`
+        :type classifier: :class:`.Classifier`
+        :param x_train: dataset used to train the classifier.
         :type x_train: :class:`numpy.ndarray`
-        :param y_train: labels used to train `classifier`
+        :param y_train: labels used to train the classifier.
         :type y_train: :class:`numpy.ndarray`
-        :param verbose: When True prints more information
-        :type verbose: `bool`
         """
         self.classifier = classifier
         self.x_train = x_train
         self.y_train = y_train
-        self.verbose = verbose
 
     @abc.abstractmethod
     def detect_poison(self, **kwargs):
@@ -58,7 +55,7 @@ class PoisonFilteringDefence(ABC):
 
         :param kwargs: Defence-specific parameters used by child classes.
         :type kwargs: `dict`
-        :return: `list` with items identified as poison
+        :return: `(dict, list)` dictionary with report and list with items identified as poison
         """
         raise NotImplementedError
 

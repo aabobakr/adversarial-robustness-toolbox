@@ -17,8 +17,12 @@
 # SOFTWARE.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import logging
+
 import abc
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 # Ensure compatibility with Python 2 and 3 when using ABCMeta
@@ -37,19 +41,20 @@ class Attack(ABC):
     def __init__(self, classifier):
         """
         :param classifier: A trained model.
-        :type classifier: :class:`Classifier`
+        :type classifier: :class:`.Classifier`
         """
         self.classifier = classifier
 
-    def generate(self, x, **kwargs):
+    def generate(self, x, y=None):
         """
         Generate adversarial examples and return them as an array. This method should be overridden by all concrete
         attack implementations.
 
         :param x: An array with the original inputs to be attacked.
         :type x: `np.ndarray`
-        :param kwargs: Attack-specific parameters used by child classes.
-        :type kwargs: `dict`
+        :param y: Correct labels or target labels for `x`, depending if the attack is targeted
+               or not. This parameter is only used by some of the attacks.
+        :type y: `np.ndarray`
         :return: An array holding the adversarial examples.
         :rtype: `np.ndarray`
         """

@@ -1,7 +1,5 @@
+matplotlib
 numpy
-h5py
-keras
 scipy
 six
-tensorflow
 scikit-learn

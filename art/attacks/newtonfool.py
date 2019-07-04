@@ -17,77 +17,96 @@
 # SOFTWARE.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import logging
+
 import numpy as np
 
+from art import NUMPY_DTYPE
 from art.attacks.attack import Attack
+from art.utils import to_categorical
+
+logger = logging.getLogger(__name__)
 
 
 class NewtonFool(Attack):
     """
     Implementation of the attack from Uyeong Jang et al. (2017). Paper link: http://doi.acm.org/10.1145/3134600.3134635
     """
-    attack_params = Attack.attack_params + ["max_iter", "eta"]
+    attack_params = Attack.attack_params + ["max_iter", "eta", "batch_size"]
 
-    def __init__(self, classifier, max_iter=100, eta=0.01):
+    def __init__(self, classifier, max_iter=1000, eta=0.01, batch_size=128):
         """
         Create a NewtonFool attack instance.
 
         :param classifier: A trained model.
-        :type classifier: :class:`Classifier`
+        :type classifier: :class:`.Classifier`
         :param max_iter: The maximum number of iterations.
         :type max_iter: `int`
         :param eta: The eta coefficient.
         :type eta: `float`
+        :param batch_size: Batch size
+        :type batch_size: `int`
         """
         super(NewtonFool, self).__init__(classifier)
-        params = {"max_iter": max_iter, "eta": eta}
+        params = {"max_iter": max_iter, "eta": eta, "batch_size": batch_size}
         self.set_params(**params)
 
-    def generate(self, x, **kwargs):
+    def generate(self, x, y=None):
         """
         Generate adversarial samples and return them in a Numpy array.
 
         :param x: An array with the original inputs to be attacked.
         :type x: `np.ndarray`
-        :param kwargs: Attack-specific parameters used by child classes.
-        :type kwargs: `dict`
+        :param y: An array with the original labels to be predicted.
+        :type y: `np.ndarray`
         :return: An array holding the adversarial examples.
         :rtype: `np.ndarray`
         """
-        assert self.set_params(**kwargs)
-        nb_classes = self.classifier.nb_classes
-        x_adv = x.copy()
+        x_adv = x.astype(NUMPY_DTYPE)
 
         # Initialize variables
-        clip_min, clip_max = self.classifier.clip_values
         y_pred = self.classifier.predict(x, logits=False)
         pred_class = np.argmax(y_pred, axis=1)
 
-        # Main algorithm for each example
-        for j, ex in enumerate(x_adv):
-            norm_x0 = np.linalg.norm(np.reshape(ex, [-1]))
-            l = pred_class[j]
+        # Compute perturbation with implicit batching
+        for batch_id in range(int(np.ceil(x_adv.shape[0] / float(self.batch_size)))):
+            batch_index_1, batch_index_2 = batch_id * self.batch_size, (batch_id + 1) * self.batch_size
+            batch = x_adv[batch_index_1:batch_index_2]
+
+            # Main algorithm for each batch
+            norm_batch = np.linalg.norm(np.reshape(batch, (batch.shape[0], -1)), axis=1)
+            l = pred_class[batch_index_1:batch_index_2]
+            l_b = to_categorical(l, self.classifier.nb_classes).astype(bool)
 
             # Main loop of the algorithm
-            for i in range(self.max_iter):
+            for _ in range(self.max_iter):
                 # Compute score
-                score = self.classifier.predict(np.array([ex]), logits=False)[0][l]
+                score = self.classifier.predict(batch, logits=False)[l_b]
 
                 # Compute the gradients and norm
-                grads = self.classifier.class_gradient(np.array([ex]), logits=False)[0][l]
-                norm_grad = np.linalg.norm(np.reshape(grads, [-1]))
+                grads = self.classifier.class_gradient(batch, label=l, logits=False)
+                grads = np.squeeze(grads, axis=1)
+                norm_grad = np.linalg.norm(np.reshape(grads, (batch.shape[0], -1)), axis=1)
 
                 # Theta
-                theta = self._compute_theta(norm_x0, score, norm_grad, nb_classes)
+                theta = self._compute_theta(norm_batch, score, norm_grad)
 
                 # Pertubation
-                di = self._compute_pert(theta, grads, norm_grad)
+                di_batch = self._compute_pert(theta, grads, norm_grad)
 
                 # Update xi and pertubation
-                ex += di
+                batch += di_batch
 
             # Apply clip
-            x_adv[j] = np.clip(ex, clip_min, clip_max)
+            if hasattr(self.classifier, 'clip_values') and self.classifier.clip_values is not None:
+                clip_min, clip_max = self.classifier.clip_values
+                x_adv[batch_index_1:batch_index_2] = np.clip(batch, clip_min, clip_max)
+            else:
+                x_adv[batch_index_1:batch_index_2] = batch
+
+        logger.info('Success rate of NewtonFool attack: %.2f%%',
+                    (np.sum(np.argmax(self.classifier.predict(x), axis=1) !=
+                            np.argmax(self.classifier.predict(x_adv), axis=1)) / x.shape[0]))
 
         return x_adv
 
@@ -98,31 +117,39 @@ class NewtonFool(Attack):
         :type max_iter: `int`
         :param eta: The eta coefficient.
         :type eta: `float`
+        :param batch_size: Internal size of batches on which adversarial samples are generated.
+        :type batch_size: `int`
         """
         # Save attack-specific parameters
         super(NewtonFool, self).set_params(**kwargs)
 
-        if type(self.max_iter) is not int or self.max_iter <= 0:
+        if not isinstance(self.max_iter, (int, np.int)) or self.max_iter <= 0:
             raise ValueError("The number of iterations must be a positive integer.")
 
-        if type(self.eta) is not float or self.eta <= 0:
+        if not isinstance(self.eta, (float, int, np.int)) or self.eta <= 0:
             raise ValueError("The eta coefficient must be a positive float.")
+
+        if self.batch_size <= 0:
+            raise ValueError('The batch size `batch_size` has to be positive.')
 
         return True
 
-    def _compute_theta(self, norm_x0, score, norm_grad, nb_classes):
+    def _compute_theta(self, norm_batch, score, norm_grad):
         """
         Function to compute the theta at each step.
 
-        :param norm_x0: norm of x0
-        :param score: softmax value at the attacked class.
-        :param norm_grad: norm of gradient values at the attacked class.
-        :param nb_classes: number of classes.
-        :return: theta value.
+        :param norm_batch: Norm of a batch.
+        :type norm_batch: `np.ndarray`
+        :param score: Softmax value at the attacked class.
+        :type score: `np.ndarray`
+        :param norm_grad: Norm of gradient values at the attacked class.
+        :type norm_grad: `np.ndarray`
+        :return: Theta value.
+        :rtype: `np.ndarray`
         """
-        equ1 = self.eta * norm_x0 * norm_grad
-        equ2 = score - 1.0/nb_classes
-        result = min(equ1, equ2)
+        equ1 = self.eta * norm_batch * norm_grad
+        equ2 = score - 1.0 / self.classifier.nb_classes
+        result = np.minimum.reduce([equ1, equ2])
 
         return result
 
@@ -131,15 +158,21 @@ class NewtonFool(Attack):
         """
         Function to compute the pertubation at each step.
 
-        :param theta: theta value at the current step.
-        :param grads: gradient values at the attacked class.
-        :param norm_grad: norm of gradient values at the attacked class.
-        :return: pertubation.
+        :param theta: Theta value at the current step.
+        :type theta: `np.ndarray`
+        :param grads: Gradient values at the attacked class.
+        :type grads: `np.ndarray`
+        :param norm_grad: Norm of gradient values at the attacked class.
+        :type norm_grad: `np.ndarray`
+        :return: Computed perturbation.
+        :rtype: `np.ndarray`
         """
         # Pick a small scalar to avoid division by 0
         tol = 10e-8
-        nom = -theta * grads
-        denom = norm_grad**2 if norm_grad > tol else tol
-        result = nom / float(denom)
+
+        nom = -theta.reshape((-1,) + (1,) * (len(grads.shape) - 1)) * grads
+        denom = norm_grad**2
+        denom[denom < tol] = tol
+        result = nom / denom.reshape((-1,) + (1,) * (len(grads.shape) - 1))
 
         return result

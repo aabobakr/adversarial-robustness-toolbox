@@ -17,7 +17,11 @@
 # SOFTWARE.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class AdversarialTrainer:
@@ -28,16 +32,18 @@ class AdversarialTrainer:
     training on all adversarial data and other common setups. If multiple attacks are specified, they are rotated
     for each batch. If the specified attacks have as target a different model, then the attack is transferred. The
     `ratio` determines how many of the clean samples in each batch are replaced with their adversarial counterpart.
-    When the attack targets the current classifier, only successful adversarial samples are used.
+
+     .. warning:: Both successful and unsuccessful adversarial samples are used for training. In the case of
+                  unbounded attacks (e.g., DeepFool), this can result in invalid (very noisy) samples being included.
     """
     def __init__(self, classifier, attacks, ratio=.5):
         """
-        Create an :class:`AdversarialTrainer` instance.
+        Create an :class:`.AdversarialTrainer` instance.
 
         :param classifier: Model to train adversarially.
-        :type classifier: :class:`Classifier`
+        :type classifier: :class:`.Classifier`
         :param attacks: attacks to use for data augmentation in adversarial training
-        :type attacks: :class:`Attack` or `list(Attack)`
+        :type attacks: :class:`.Attack` or `list(Attack)`
         :param ratio: The proportion of samples in each batch to be replaced with their adversarial counterparts.
                       Setting this value to 1 allows to train only on adversarial samples.
         :type ratio: `float`
@@ -59,7 +65,89 @@ class AdversarialTrainer:
         self._precomputed_adv_samples = []
         self.x_augmented, self.y_augmented = None, None
 
-    def fit(self, x, y, batch_size=128, nb_epochs=20):
+    def fit_generator(self, generator, nb_epochs=20, **kwargs):
+        """
+        Train a model adversarially using a data generator.
+        See class documentation for more information on the exact procedure.
+
+        :param generator: Data generator.
+        :type generator: :class:`.DataGenerator`
+        :param nb_epochs: Number of epochs to use for trainings.
+        :type nb_epochs: `int`
+        :param kwargs: Dictionary of framework-specific arguments. These will be passed as such to the `fit` function of
+               the target classifier.
+        :type kwargs: `dict`
+        :return: `None`
+        """
+        logger.info('Performing adversarial training using %i attacks.', len(self.attacks))
+        size = generator.size
+        batch_size = generator.batch_size
+        nb_batches = int(np.ceil(size / batch_size))
+        ind = np.arange(generator.size)
+        attack_id = 0
+
+        # Precompute adversarial samples for transferred attacks
+        logged = False
+        self._precomputed_adv_samples = []
+        for attack in self.attacks:
+            if 'targeted' in attack.attack_params:
+                if attack.targeted:
+                    raise NotImplementedError("Adversarial training with targeted attacks is \
+                                               currently not implemented")
+
+            if attack.classifier != self.classifier:
+                if not logged:
+                    logger.info('Precomputing transferred adversarial samples.')
+                    logged = True
+
+                next_precomputed_adv_samples = None
+                for batch_id in range(nb_batches):
+                    # Create batch data
+                    x_batch, y_batch = generator.get_batch()
+                    x_adv_batch = attack.generate(x_batch, y=y_batch)
+                    if next_precomputed_adv_samples is None:
+                        next_precomputed_adv_samples = x_adv_batch
+                    else:
+                        next_precomputed_adv_samples = np.append(next_precomputed_adv_samples, x_adv_batch, axis=0)
+                self._precomputed_adv_samples.append(next_precomputed_adv_samples)
+            else:
+                self._precomputed_adv_samples.append(None)
+
+        for e in range(nb_epochs):
+            logger.info('Adversarial training epoch %i/%i', e, nb_epochs)
+
+            # Shuffle the indices of precomputed examples
+            np.random.shuffle(ind)
+
+            for batch_id in range(nb_batches):
+                # Create batch data
+                x_batch, y_batch = generator.get_batch()
+                x_batch = x_batch.copy()
+
+                # Choose indices to replace with adversarial samples
+                nb_adv = int(np.ceil(self.ratio * x_batch.shape[0]))
+                attack = self.attacks[attack_id]
+                if self.ratio < 1:
+                    adv_ids = np.random.choice(x_batch.shape[0], size=nb_adv, replace=False)
+                else:
+                    adv_ids = list(range(x_batch.shape[0]))
+                    np.random.shuffle(adv_ids)
+
+                # If source and target models are the same, craft fresh adversarial samples
+                if attack.classifier == self.classifier:
+                    x_batch[adv_ids] = attack.generate(x_batch[adv_ids], y=y_batch[adv_ids])
+
+                # Otherwise, use precomputed adversarial samples
+                else:
+                    x_adv = self._precomputed_adv_samples[attack_id]
+                    x_adv = x_adv[ind[batch_id * batch_size:min((batch_id + 1) * batch_size, size)]][adv_ids]
+                    x_batch[adv_ids] = x_adv
+
+                # Fit batch
+                self.classifier.fit(x_batch, y_batch, nb_epochs=1, batch_size=x_batch.shape[0], **kwargs)
+                attack_id = (attack_id + 1) % len(self.attacks)
+
+    def fit(self, x, y, batch_size=128, nb_epochs=20, **kwargs):
         """
         Train a model adversarially. See class documentation for more information on the exact procedure.
 
@@ -71,42 +159,56 @@ class AdversarialTrainer:
         :type batch_size: `int`
         :param nb_epochs: Number of epochs to use for trainings.
         :type nb_epochs: `int`
+        :param kwargs: Dictionary of framework-specific arguments. These will be passed as such to the `fit` function of
+               the target classifier.
+        :type kwargs: `dict`
         :return: `None`
         """
+        logger.info('Performing adversarial training using %i attacks.', len(self.attacks))
         nb_batches = int(np.ceil(len(x) / batch_size))
-        nb_adv = int(np.ceil(self.ratio * batch_size))
         ind = np.arange(len(x))
         attack_id = 0
 
         # Precompute adversarial samples for transferred attacks
+        logged = False
         self._precomputed_adv_samples = []
         for attack in self.attacks:
+            if 'targeted' in attack.attack_params:
+                if attack.targeted:
+                    raise NotImplementedError("Adversarial training with targeted attacks is \
+                                               currently not implemented")
+
             if attack.classifier != self.classifier:
-                self._precomputed_adv_samples.append(attack.generate(x))
+                if not logged:
+                    logger.info('Precomputing transferred adversarial samples.')
+                    logged = True
+                self._precomputed_adv_samples.append(attack.generate(x, y=y))
             else:
                 self._precomputed_adv_samples.append(None)
 
-        for _ in range(nb_epochs):
+        for e in range(nb_epochs):
+            logger.info('Adversarial training epoch %i/%i', e, nb_epochs)
+
             # Shuffle the examples
             np.random.shuffle(ind)
 
             for batch_id in range(nb_batches):
                 # Create batch data
-                x_batch = x[ind[batch_id * batch_size:min((batch_id + 1) * batch_size, x.shape[0])]]
+                x_batch = x[ind[batch_id * batch_size:min((batch_id + 1) * batch_size, x.shape[0])]].copy()
                 y_batch = y[ind[batch_id * batch_size:min((batch_id + 1) * batch_size, x.shape[0])]]
 
                 # Choose indices to replace with adversarial samples
+                nb_adv = int(np.ceil(self.ratio * x_batch.shape[0]))
                 attack = self.attacks[attack_id]
-                adv_ids = np.random.choice(x_batch.shape[0], size=nb_adv, replace=False)
+                if self.ratio < 1:
+                    adv_ids = np.random.choice(x_batch.shape[0], size=nb_adv, replace=False)
+                else:
+                    adv_ids = list(range(x_batch.shape[0]))
+                    np.random.shuffle(adv_ids)
 
                 # If source and target models are the same, craft fresh adversarial samples
                 if attack.classifier == self.classifier:
-                    labels_batch = np.argmax(y_batch, axis=1)
-                    x_adv = attack.generate(x_batch[adv_ids])
-                    y_adv = np.argmax(attack.classifier.predict(x_adv), axis=1)
-                    selected = np.array(y_adv != labels_batch[adv_ids])
-
-                    x_batch[adv_ids][selected] = x_adv[selected]
+                    x_batch[adv_ids] = attack.generate(x_batch[adv_ids], y=y_batch[adv_ids])
 
                 # Otherwise, use precomputed adversarial samples
                 else:
@@ -115,7 +217,7 @@ class AdversarialTrainer:
                     x_batch[adv_ids] = x_adv
 
                 # Fit batch
-                self.classifier.fit(x_batch, y_batch, nb_epochs=1, batch_size=x_batch.shape[0])
+                self.classifier.fit(x_batch, y_batch, nb_epochs=1, batch_size=x_batch.shape[0], **kwargs)
                 attack_id = (attack_id + 1) % len(self.attacks)
 
     def predict(self, x, **kwargs):
@@ -130,45 +232,3 @@ class AdversarialTrainer:
         :rtype: `np.ndarray`
         """
         return self.classifier.predict(x, **kwargs)
-
-
-class StaticAdversarialTrainer(AdversarialTrainer):
-    """
-    Class performing adversarial training based on a model architecture and one or multiple attack methods. This method
-    is static in the sense that all adversarial samples are generated statically before training. They are added to the
-    original training sample. Training is then performed on the mixed dataset. Each attack specified when creating the
-    instance is applied to all samples in the dataset, and only the successful ones (on the source model) are kept for
-    data augmentation. This implies that for `m` attacks and a training set of size `n`, the final training set has a
-    maximum size of `(n + 1) * m`.
-    """
-    def fit(self, x, y, **kwargs):
-        """
-        Apply static adversarial training to a :class:`Classifier`.
-
-        :param x: Training set.
-        :type x: `np.ndarray`
-        :param y: Labels for the training set.
-        :type y: `np.ndarray`
-        :param kwargs: Parameters to be passed on to the `fit` function of the classifier.
-        :type kwargs: `dict`
-        :return: `None`
-        """
-        x_augmented = list(x.copy())
-        y_augmented = list(y.copy())
-        labels = np.argmax(y, axis=1)
-
-        # Generate adversarial samples for each attack
-        for attack in self.attacks:
-            # Predict new labels for the adversarial samples generated
-            x_adv = attack.generate(x)
-            y_pred = np.argmax(attack.classifier.predict(x_adv), axis=1)
-            selected = np.array(labels != y_pred)
-
-            # Only add successful attacks to augmented dataset
-            x_augmented.extend(list(x_adv[selected]))
-            y_augmented.extend(list(y[selected]))
-
-        # Fit the model with the extended dataset
-        self.x_augmented = np.array(x_augmented)
-        self.y_augmented = np.array(y_augmented)
-        self.classifier.fit(self.x_augmented, self.y_augmented, **kwargs)

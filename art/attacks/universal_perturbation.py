@@ -17,11 +17,15 @@
 # SOFTWARE.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import numpy as np
+import logging
 import random
+
+import numpy as np
 
 from art.attacks.attack import Attack
 from art.utils import projection
+
+logger = logging.getLogger(__name__)
 
 
 class UniversalPerturbation(Attack):
@@ -30,8 +34,12 @@ class UniversalPerturbation(Attack):
     future inputs. To this end, it can use any adversarial attack method. Paper link: https://arxiv.org/abs/1610.08401
     """
     attacks_dict = {'carlini': 'art.attacks.carlini.CarliniL2Method',
+                    'carlini_inf': 'art.attacks.carlini.CarliniLInfMethod',
                     'deepfool': 'art.attacks.deepfool.DeepFool',
+                    'ead': 'art.attacks.elastic_net.ElasticNet',
                     'fgsm': 'art.attacks.fast_gradient.FastGradientMethod',
+                    'bim': 'art.attacks.iterative_method.BasicIterativeMethod',
+                    'pgd': 'art.attacks.projected_gradient_descent.ProjectedGradientDescent',
                     'newtonfool': 'art.attacks.newtonfool.NewtonFool',
                     'jsma': 'art.attacks.saliency_map.SaliencyMapMethod',
                     'vat': 'art.attacks.virtual_adversarial.VirtualAdversarialMethod'
@@ -42,9 +50,9 @@ class UniversalPerturbation(Attack):
                  norm=np.inf):
         """
         :param classifier: A trained model.
-        :type classifier: :class:`Classifier`
-        :param attacker: Adversarial attack name. Default is 'deepfool'. Supported names: 'carlini', 'deepfool', 'fgsm',
-                'newtonfool', 'jsma', 'vat'.
+        :type classifier: :class:`.Classifier`
+        :param attacker: Adversarial attack name. Default is 'deepfool'. Supported names: 'carlini', 'carlini_inf',
+                         'deepfool', 'fgsm', 'bim', 'pgd', 'margin', 'ead', 'newtonfool', 'jsma', 'vat'.
         :type attacker: `str`
         :param attacker_params: Parameters specific to the adversarial attack.
         :type attacker_params: `dict`
@@ -67,32 +75,21 @@ class UniversalPerturbation(Attack):
                   }
         self.set_params(**kwargs)
 
-    def generate(self, x, **kwargs):
+    def generate(self, x, y=None):
         """
         Generate adversarial samples and return them in an array.
 
         :param x: An array with the original inputs.
         :type x: `np.ndarray`
-        :param attacker: Adversarial attack name. Default is 'deepfool'. Supported names: 'carlini', 'deepfool', 'fgsm',
-                'newtonfool', 'jsma', 'vat'.
-        :type attacker: `str`
-        :param attacker_params: Parameters specific to the adversarial attack.
-        :type attacker_params: `dict`
-        :param delta: desired accuracy
-        :type delta: `float`
-        :param max_iter: The maximum number of iterations for computing universal perturbation.
-        :type max_iter: `int`
-        :param eps: Attack step size (input variation)
-        :type eps: `float`
-        :param norm: Order of the norm. Possible values: np.inf, 1 and 2 (default is np.inf).
-        :type norm: `int`
+        :param y: An array with the original labels to be predicted.
+        :type y: `np.ndarray`
         :return: An array holding the adversarial examples.
         :rtype: `np.ndarray`
         """
-        assert self.set_params(**kwargs)
+        logger.info('Computing universal perturbation based on %s attack.', self.attacker)
 
         # Init universal perturbation
-        v = 0
+        noise = 0
         fooling_rate = 0.0
         nb_instances = len(x)
 
@@ -111,34 +108,38 @@ class UniversalPerturbation(Attack):
             for j, ex in enumerate(x[rnd_idx]):
                 xi = ex[None, ...]
 
-                f_xi = self.classifier.predict(xi + v, logits=True)
-                fk_i_hat = np.argmax(f_xi[0])
-                fk_hat = np.argmax(pred_y[rnd_idx][j])
+                current_label = np.argmax(self.classifier.predict(xi + noise, logits=True)[0])
+                original_label = np.argmax(pred_y[rnd_idx][j])
 
-                if fk_i_hat == fk_hat:
+                if current_label == original_label:
                     # Compute adversarial perturbation
-                    adv_xi = attacker.generate(xi + v)
-                    adv_f_xi = self.classifier.predict(adv_xi, logits=True)
-                    adv_fk_i_hat = np.argmax(adv_f_xi[0])
+                    adv_xi = attacker.generate(xi + noise)
+                    new_label = np.argmax(self.classifier.predict(adv_xi, logits=True)[0])
 
                     # If the class has changed, update v
-                    if fk_i_hat != adv_fk_i_hat:
-                        v += adv_xi - xi
+                    if current_label != new_label:
+                        noise = adv_xi - xi
 
                         # Project on L_p ball
-                        v = projection(v, self.eps, self.norm)
+                        noise = projection(noise, self.eps, self.norm)
             nb_iter += 1
 
+            # Apply attack and clip
+            x_adv = x + noise
+            if hasattr(self.classifier, 'clip_values') and self.classifier.clip_values is not None:
+                clip_min, clip_max = self.classifier.clip_values
+                x_adv = np.clip(x_adv, clip_min, clip_max)
+
             # Compute the error rate
-            adv_x = x + v
-            adv_y = np.argmax(self.classifier.predict(adv_x, logits=False))
-            fooling_rate = np.sum(pred_y_max != adv_y) / nb_instances
+            y_adv = np.argmax(self.classifier.predict(x_adv, logits=False), axis=1)
+            fooling_rate = np.sum(pred_y_max != y_adv) / nb_instances
 
         self.fooling_rate = fooling_rate
-        self.converged = (nb_iter < self.max_iter)
-        self.v = v
+        self.converged = nb_iter < self.max_iter
+        self.noise = noise
+        logger.info('Success rate of universal perturbation attack: %.2f%%', fooling_rate)
 
-        return adv_x
+        return x_adv
 
     def set_params(self, **kwargs):
         """
@@ -160,13 +161,13 @@ class UniversalPerturbation(Attack):
         """
         super(UniversalPerturbation, self).set_params(**kwargs)
 
-        if type(self.delta) is not float or self.delta < 0 or self.delta > 1:
+        if not isinstance(self.delta, (float, int)) or self.delta < 0 or self.delta > 1:
             raise ValueError("The desired accuracy must be in the range [0, 1].")
 
-        if type(self.max_iter) is not int or self.max_iter <= 0:
+        if not isinstance(self.max_iter, (int, np.int)) or self.max_iter <= 0:
             raise ValueError("The number of iterations must be a positive integer.")
 
-        if type(self.eps) is not float or self.eps <= 0:
+        if not isinstance(self.eps, (float, int)) or self.eps <= 0:
             raise ValueError("The eps coefficient must be a positive float.")
 
         return True

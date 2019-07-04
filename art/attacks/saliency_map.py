@@ -17,9 +17,14 @@
 # SOFTWARE.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import logging
+
 import numpy as np
 
+from art import NUMPY_DTYPE
 from art.attacks.attack import Attack
+
+logger = logging.getLogger(__name__)
 
 
 class SaliencyMapMethod(Attack):
@@ -27,28 +32,26 @@ class SaliencyMapMethod(Attack):
     Implementation of the Jacobian-based Saliency Map Attack (Papernot et al. 2016).
     Paper link: https://arxiv.org/pdf/1511.07528.pdf
     """
-    attack_params = Attack.attack_params + ['theta', 'gamma']
+    attack_params = Attack.attack_params + ['theta', 'gamma', 'batch_size']
 
-    # TODO Add parameter logits?
-    def __init__(self, classifier, theta=0.1, gamma=1.):
+    def __init__(self, classifier, theta=0.1, gamma=1., batch_size=128):
         """
         Create a SaliencyMapMethod instance.
 
         :param classifier: A trained model.
-        :type classifier: :class:`Classifier`
+        :type classifier: :class:`.Classifier`
         :param theta: Perturbation introduced to each modified feature per step (can be positive or negative).
         :type theta: `float`
         :param gamma: Maximum percentage of perturbed features (between 0 and 1).
         :type gamma: `float`
+        :param batch_size: Batch size
+        :type batch_size: `int`
         """
         super(SaliencyMapMethod, self).__init__(classifier)
-        kwargs = {
-            'theta': theta,
-            'gamma': gamma
-            }
+        kwargs = {'theta': theta, 'gamma': gamma, 'batch_size': batch_size}
         self.set_params(**kwargs)
 
-    def generate(self, x, **kwargs):
+    def generate(self, x, y=None):
         """
         Generate adversarial samples and return them in an array.
 
@@ -56,71 +59,93 @@ class SaliencyMapMethod(Attack):
         :type x: `np.ndarray`
         :param y: Target values if the attack is targeted
         :type y: `np.ndarray`
-        :param theta: Perturbation introduced to each modified feature per step (can be positive or negative)
-        :type theta: `float`
-        :param gamma: Maximum percentage of perturbed features (between 0 and 1)
-        :type gamma: `float`
         :return: An array holding the adversarial examples.
         :rtype: `np.ndarray`
         """
-        # Parse and save attack-specific parameters
-        self.set_params(**kwargs)
-        clip_min, clip_max = self.classifier.clip_values
-
         # Initialize variables
-        dims = [1] + list(x.shape[1:])
+        dims = list(x.shape[1:])
         self._nb_features = np.product(dims)
-        x_adv = np.reshape(np.copy(x), (-1, self._nb_features))
+        x_adv = np.reshape(x.astype(NUMPY_DTYPE), (-1, self._nb_features))
         preds = np.argmax(self.classifier.predict(x), axis=1)
 
         # Determine target classes for attack
-        if 'y' not in kwargs or kwargs[str('y')] is None:
+        if y is None:
             # Randomly choose target from the incorrect classes for each sample
             from art.utils import random_targets
             targets = np.argmax(random_targets(preds, self.classifier.nb_classes), axis=1)
         else:
-            targets = np.argmax(kwargs[str('y')], axis=1)
+            targets = np.argmax(y, axis=1)
 
-        # Generate the adversarial samples
-        for ind, val in enumerate(x_adv):
+        # Compute perturbation with implicit batching
+        for batch_id in range(int(np.ceil(x_adv.shape[0] / float(self.batch_size)))):
+            batch_index_1, batch_index_2 = batch_id * self.batch_size, (batch_id + 1) * self.batch_size
+            batch = x_adv[batch_index_1:batch_index_2]
+
+            # Main algorithm for each batch
             # Initialize the search space; optimize to remove features that can't be changed
-            if self.theta > 0:
-                search_space = set([i for i in range(self._nb_features) if val[i] < clip_max])
-            else:
-                search_space = set([i for i in range(self._nb_features) if val[i] > clip_min])
-
-            current_pred = preds[ind]
-            target = targets[ind]
-            all_feat = set()
-
-            while current_pred != target and len(all_feat) / self._nb_features <= self.gamma and bool(search_space):
-                # Compute saliency map
-                feat1, feat2 = self._saliency_map(np.reshape(val, dims), target, search_space)
-
-                # Move on to next examples if there are no more features to change
-                if feat1 == feat2 == 0:
-                    break
-
-                all_feat = all_feat.union(set([feat1, feat2]))
-
-                # Prepare update depending of theta
+            search_space = np.zeros_like(batch)
+            if hasattr(self.classifier, 'clip_values') and self.classifier.clip_values is not None:
+                clip_min, clip_max = self.classifier.clip_values
                 if self.theta > 0:
-                    clip_func, clip_value = np.minimum, clip_max
+                    search_space[batch < clip_max] = 1
                 else:
-                    clip_func, clip_value = np.maximum, clip_min
+                    search_space[batch > clip_min] = 1
 
-                # Update adversarial example
-                for feature_ind in [feat1, feat2]:
-                    val[feature_ind] = clip_func(clip_value, val[feature_ind] + self.theta)
+            # Get current predictions
+            current_pred = preds[batch_index_1:batch_index_2]
+            target = targets[batch_index_1:batch_index_2]
+            active_indices = np.where(current_pred != target)[0]
+            all_feat = np.zeros_like(batch)
+
+            while len(active_indices) != 0:
+                # Compute saliency map
+                feat_ind = self._saliency_map(np.reshape(batch, [batch.shape[0]] + dims)[active_indices],
+                                              target[active_indices], search_space[active_indices])
+
+                # Update used features
+                all_feat[active_indices][np.arange(len(active_indices)), feat_ind[:, 0]] = 1
+                all_feat[active_indices][np.arange(len(active_indices)), feat_ind[:, 1]] = 1
+
+                # Apply attack with clipping
+                if hasattr(self.classifier, 'clip_values') and self.classifier.clip_values is not None:
+                    # Prepare update depending of theta
+                    if self.theta > 0:
+                        clip_func, clip_value = np.minimum, clip_max
+                    else:
+                        clip_func, clip_value = np.maximum, clip_min
+
+                    # Update adversarial examples
+                    tmp_batch = batch[active_indices]
+                    tmp_batch[np.arange(len(active_indices)), feat_ind[:, 0]] = \
+                        clip_func(clip_value, tmp_batch[np.arange(len(active_indices)), feat_ind[:, 0]] + self.theta)
+                    tmp_batch[np.arange(len(active_indices)), feat_ind[:, 1]] = \
+                        clip_func(clip_value, tmp_batch[np.arange(len(active_indices)), feat_ind[:, 1]] + self.theta)
+                    batch[active_indices] = tmp_batch
 
                     # Remove indices from search space if max/min values were reached
-                    if val[feature_ind] == clip_value:
-                        search_space.discard(feature_ind)
+                    search_space[batch == clip_value] = 0
+
+                # Apply attack without clipping
+                else:
+                    tmp_batch = batch[active_indices]
+                    tmp_batch[np.arange(len(active_indices)), feat_ind[:, 0]] += self.theta
+                    tmp_batch[np.arange(len(active_indices)), feat_ind[:, 1]] += self.theta
+                    batch[active_indices] = tmp_batch
 
                 # Recompute model prediction
-                current_pred = np.argmax(self.classifier.predict(np.reshape(val, dims)), axis=1)
+                current_pred = np.argmax(self.classifier.predict(np.reshape(batch, [batch.shape[0]] + dims)), axis=1)
+
+                # Update active_indices
+                active_indices = np.where((current_pred != target) *
+                                          (np.sum(all_feat, axis=1) / self._nb_features <= self.gamma) *
+                                          (np.sum(search_space, axis=1) > 0))[0]
+
+            x_adv[batch_index_1:batch_index_2] = batch
 
         x_adv = np.reshape(x_adv, x.shape)
+        logger.info('Success rate of JSMA attack: %.2f%%',
+                    (np.sum(np.argmax(self.classifier.predict(x), axis=1) !=
+                            np.argmax(self.classifier.predict(x_adv), axis=1)) / x.shape[0]))
 
         return x_adv
 
@@ -132,12 +157,17 @@ class SaliencyMapMethod(Attack):
         :type theta: `float`
         :param gamma: Maximum percentage of perturbed features (between 0 and 1)
         :type gamma: `float`
+        :param batch_size: Internal size of batches on which adversarial samples are generated.
+        :type batch_size: `int`
         """
         # Save attack-specific parameters
         super(SaliencyMapMethod, self).set_params(**kwargs)
 
         if self.gamma <= 0 or self.gamma > 1:
             raise ValueError("The total perturbation percentage `gamma` must be between 0 and 1.")
+
+        if self.batch_size <= 0:
+            raise ValueError('The batch size `batch_size` has to be positive.')
 
         return True
 
@@ -146,72 +176,26 @@ class SaliencyMapMethod(Attack):
         Compute the saliency map of `x`. Return the top 2 coefficients in `search_space` that maximize / minimize
         the saliency map.
 
-        :param x: One input sample
+        :param x: A batch of input samples
         :type x: `np.ndarray`
         :param target: Target class for `x`
-        :type target: `int`
+        :type target: `np.ndarray`
         :param search_space: The set of valid pairs of feature indices to search
-        :type search_space: `set(tuple)`
+        :type search_space: `np.ndarray`
         :return: The top 2 coefficients in `search_space` that maximize / minimize the saliency map
-        :rtype: `tuple`
+        :rtype: `np.ndarray`
         """
         grads = self.classifier.class_gradient(x, label=target, logits=False)
-        grads = np.reshape(grads, (-1, self._nb_features))[0]
-
-        # Remove gradients for already used features
-        used_features = list(set(range(self._nb_features)) - search_space)
-        coeff = 2 * int(self.theta > 0) - 1
-        grads[used_features] = -np.inf * coeff
-
-        if self.theta > 0:
-            ind = np.argpartition(grads, -2)[-2:]
-        else:
-            ind = np.argpartition(-grads, -2)[-2:]
-
-        return tuple(ind)
-
-    def _saliency_map_logits(self, x, target, search_space):
-        """
-        Compute the saliency map of `x`. Return the top 2 coefficients in `search_space` that maximize / minimize
-        the saliency map.
-
-        :param x: One input sample
-        :type x: `np.ndarray`
-        :param target: Target class for `x`
-        :type target: `int`
-        :param search_space: The set of valid pairs of feature indices to search
-        :type search_space: `set(tuple)`
-        :return: The top 2 coefficients in `search_space` that maximize / minimize the saliency map
-        :rtype: `tuple`
-        """
-        grads = self.classifier.class_gradient(x, logits=True)
         grads = np.reshape(grads, (-1, self._nb_features))
 
-        # Compute grads for target class and sum of gradients for all other classes
-        grads_target = grads[target]
-        other_mask = list(range(self.classifier.nb_classes))
-        other_mask.remove(target)
-        grads_others = np.sum(grads[other_mask, :], axis=0)
-
         # Remove gradients for already used features
-        used_features = list(set(range(self._nb_features)) - search_space)
+        used_features = 1 - search_space
         coeff = 2 * int(self.theta > 0) - 1
-        grads_target[used_features] = - np.max(np.abs(grads_target)) * coeff
-        grads_others[used_features] = np.max(np.abs(grads_others)) * coeff
-
-        # Precompute all pairs of sums of gradients and cache
-        sums_target = grads_target.reshape((1, self._nb_features)) + grads_target.reshape((self._nb_features, 1))
-        sums_others = grads_others.reshape((1, self._nb_features)) + grads_others.reshape((self._nb_features, 1))
+        grads[used_features == 1] = -np.inf * coeff
 
         if self.theta > 0:
-            mask = (sums_target > 0) & (sums_others < 0)
+            ind = np.argpartition(grads, -2, axis=1)[:, -2:]
         else:
-            mask = (sums_target < 0) & (sums_others > 0)
-        scores = mask * (-sums_target * sums_others)
-        np.fill_diagonal(scores, 0)
+            ind = np.argpartition(-grads, -2, axis=1)[:, -2:]
 
-        # Choose top 2 features
-        best_pair = np.argmax(scores)
-        ind1, ind2 = best_pair % self._nb_features, best_pair // self._nb_features
-
-        return ind1, ind2
+        return ind

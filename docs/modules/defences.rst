@@ -26,12 +26,38 @@ Adversarial Training
    :members:
    :special-members:
 
-.. autoclass:: StaticAdversarialTrainer
-   :members:
-   :special-members:
-
 Gaussian Data Augmentation
 --------------------------
 .. autoclass:: GaussianAugmentation
+   :members:
+   :special-members:
+
+PixelDefend
+-----------
+.. autoclass:: PixelDefend
+   :members:
+   :special-members:
+
+JPEG Compression
+----------------
+.. autoclass:: JpegCompression
+   :members:
+   :special-members:
+
+Thermometer Encoding
+--------------------
+.. autoclass:: ThermometerEncoding
+   :members:
+   :special-members:
+
+Total Variance Minimization
+---------------------------
+.. autoclass:: TotalVarMin
+   :members:
+   :special-members:
+
+Base Preprocessor Class
+-----------------------
+.. autoclass:: Preprocessor
    :members:
    :special-members:
